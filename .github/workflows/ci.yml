@@ -1,0 +1,126 @@
+name: RGF Verification CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+# Concurrency:
+#   Cancel superseded runs ONLY for pull-request events. A cancellation is
+#   delivered as SIGTERM, which surfaces as exit code 143 — the exact symptom we
+#   are trying to eliminate. On `push` to main/master a full green build is
+#   valuable, so we do NOT cancel an in-progress push run just because a newer
+#   commit arrived; letting it finish avoids a spurious 143.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-and-audit:
+    runs-on: ubuntu-latest
+    # Generous budget. Exit code 143 = 128 + 15 = SIGTERM: the previous failures
+    # were the job being terminated at the timeout wall (or by concurrency
+    # cancellation / resource pressure), NOT a Lean compile error. The single
+    # biggest budget risk is a COLD Mathlib cache forcing a from-source rebuild
+    # of all of Mathlib (~1-2h) before the RGF sources even start compiling;
+    # that is what pushed earlier runs past the wall. We: (a) make the Mathlib
+    # cache download robust (see below) so we never silently fall back to a
+    # from-source rebuild, and (b) keep a wide wall so a genuinely cold run can
+    # still finish.
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install elan (Lean version manager)
+      run: |
+        curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+        echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+    - name: Verify Lean version
+      run: lean --version
+
+    - name: Cache .lake (Mathlib + RGF build artifacts)
+      uses: actions/cache@v4
+      with:
+        # Caching the whole .lake tree keeps BOTH the downloaded Mathlib oleans
+        # AND previously-compiled RGF modules, so a rerun only recompiles the
+        # files that actually changed (incremental), keeping each run well under
+        # the wall.
+        path: .lake
+        key: rgf-lake-${{ hashFiles('lake-manifest.json') }}-${{ hashFiles('lean-toolchain') }}
+        restore-keys: |
+          rgf-lake-${{ hashFiles('lake-manifest.json') }}-
+          rgf-lake-
+
+    - name: Fetch prebuilt Mathlib cache (robust; no silent from-source fallback)
+      run: |
+        # `lake exe cache get` downloads prebuilt Mathlib oleans. If this step
+        # is skipped or its failure is swallowed (the old `|| true`), a cache
+        # miss silently degrades into recompiling ALL of Mathlib from source,
+        # which is what burned the time budget and got the job SIGTERM-ed (143).
+        # Retry a few times to ride out transient network/CDN hiccups.
+        for attempt in 1 2 3; do
+          echo "::group::lake exe cache get (attempt $attempt)"
+          if lake exe cache get; then
+            echo "::endgroup::"
+            echo "Mathlib cache fetched successfully."
+            exit 0
+          fi
+          echo "::endgroup::"
+          echo "cache get attempt $attempt failed; retrying in 30s..."
+          sleep 30
+        done
+        echo "WARNING: could not fetch the prebuilt Mathlib cache after 3 attempts."
+        echo "The build may fall back to compiling Mathlib from source and take much longer."
+        # Do not hard-fail here: a from-source build is still correct, just slow,
+        # and the wide timeout above is meant to absorb that rare case.
+
+    - name: Tier-1 isolation check (architecture invariant)
+      run: |
+        # Enforces the three-tier architecture:
+        # the transitive import closure of every Tier-1 module
+        # (RGF.Generative.Core.* + RGF.Math.*) contains no Tier-2/3
+        # module (Physics / Phenomenology / Locking / Uniqueness /
+        # Applications / Assembly / Bridge / Meta). This makes
+        # "Tier 1 is independent" a mechanically checked fact.
+        python3 scripts/check_tier_boundary.py
+
+    - name: Tier-1 gate self-test (negative / counterexample test)
+      run: |
+        # A guard tool must be shown to FAIL on a known-bad input, not merely
+        # to PASS on the clean tree. This injects a deliberate Tier-1 -> Tier-3
+        # illegal import, asserts check_tier_boundary.py exits non-zero and
+        # names the offending edge, then restores the file. See
+        # scripts/selftest_tier_boundary.py.
+        python3 scripts/selftest_tier_boundary.py
+
+    - name: Build the whole project (compile audit)
+      run: |
+        # Bound parallelism to trim the memory peak. The GitHub-hosted
+        # ubuntu-latest runner has 4 vCPUs / 16 GB RAM; a few RGF modules are
+        # heavy elaborations, and unbounded parallelism can spike memory. `-j 4`
+        # matches the core count while avoiding runaway concurrent heavy jobs.
+        # (If a run is ever hard-killed with exit 137 = SIGKILL = OOM, lower
+        # this to `-j 2`.)
+        lake build -j 4 2>&1 | tee build.log
+
+    - name: Verify the project has no undocumented 'sorry'
+      run: |
+        # A genuine `sorry` in compiled code produces the warning
+        # "declaration uses 'sorry'". The literal token also appears in prose
+        # (docstrings, comments), so we detect the compiler warning rather than
+        # the token itself.
+        #
+        # The project currently has exactly ONE honestly-documented open gap:
+        # `card_W_H4 : Nat.card W_H4 = 14400` in
+        # RGF/Math/Algebra/CoxeterFiveFold.lean. Establishing the order of the
+        # 14400-element Coxeter group H4 by the covering-set method used for
+        # A3/B3/H3 requires an enumeration that is prohibitively large, and
+        # Mathlib currently has no finiteness/cardinality theory for Coxeter
+        # groups (nor the parabolic-subgroup machinery that would give a
+        # smaller proof). This gap is allow-listed BY FILE below; every other
+        # `sorry` — including any *new* one — still fails the build.
+        python3 scripts/check_sorry.py build.log

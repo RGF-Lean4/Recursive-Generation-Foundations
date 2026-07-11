@@ -1,0 +1,2 @@
+-- RGF: Recursive Generation Foundations — unified entry point
+-- This file serves as the root module of the RGF system.
