@@ -1,8 +1,3 @@
-This project was edited by [Aristotle](https://aristotle.harmonic.fun).
+Recursive Generation Foundations (RGF)
 
-To cite Aristotle:
-- Tag @Aristotle-Harmonic on GitHub PRs/issues
-- Add as co-author to commits:
-```
-Co-authored-by: Aristotle (Harmonic) <aristotle-harmonic@harmonic.fun>
-```
+研究递归生成（Recursive Generation）方法与其实现细节。请查看仓库中的源码与示例以获取完整说明与使用方法。
