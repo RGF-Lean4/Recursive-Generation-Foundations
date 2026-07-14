@@ -1,4 +1,4 @@
-# Recursive Generation Foundations (RGF)
+# 1
 
 <div align="center">
 
@@ -468,4 +468,3 @@ If you use RGF in published work, please cite:
 
 **Last Updated**: July 2026  
 **Maintainers**: RGF-Lean4 Team
-
